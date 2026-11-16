@@ -43,6 +43,9 @@ CP_KV_T_DYN = pl.dynamic("PREFILL_CP_KV_T_DYN")
 
 # model config
 D = M.hidden_size
+HCA_HEAD_DIM = M.head_dim
+HC_MULT = M.hc_mult
+HC_COMB_DIM = HC_MULT * HC_MULT
 
 # communication bounds
 PREFILL_GROUP_CAP = 8192
@@ -52,6 +55,23 @@ PREFILL_LOCAL_CAP = PREFILL_GROUP_CAP // TP_SIZE
 COMM_ROW_TILE = 8
 READBACK_ROW_TILE = gcd(MOE_TOKENS // DECODE_SEQ * (DECODE_SEQ - 1), 16)
 READBACK_WORKERS = 16
+HCA_POST_PAD_TILE = 8
+
+# Packed HCA projection columns in the existing BF16 communication window.
+HCA_PROJECTION_VALUES_OFFSET = HCA_HEAD_DIM
+HCA_PROJECTION_SCORES_OFFSET = HCA_PROJECTION_VALUES_OFFSET + 2 * HCA_HEAD_DIM
+HCA_PROJECTION_POST_OFFSET = HCA_PROJECTION_SCORES_OFFSET + 2 * HCA_HEAD_DIM
+HCA_PROJECTION_COMB_OFFSET = HCA_PROJECTION_POST_OFFSET + 2 * HCA_POST_PAD_TILE
+HCA_PROJECTION_PADDING_OFFSET = HCA_PROJECTION_COMB_OFFSET + 2 * HC_COMB_DIM
+HCA_PROJECTION_PADDING_COLS = 16
+HCA_PROJECTION_PAYLOAD_DIM = HCA_PROJECTION_PADDING_OFFSET + HCA_PROJECTION_PADDING_COLS
+
+# Packed SWA KV and lossless HC coefficients in the existing BF16 window.
+SWA_PROJECTION_POST_OFFSET = HCA_HEAD_DIM
+SWA_PROJECTION_COMB_OFFSET = SWA_PROJECTION_POST_OFFSET + 2 * HCA_POST_PAD_TILE
+SWA_PROJECTION_PADDING_OFFSET = SWA_PROJECTION_COMB_OFFSET + 2 * HC_COMB_DIM
+SWA_PROJECTION_PADDING_COLS = 16
+SWA_PROJECTION_PAYLOAD_DIM = SWA_PROJECTION_PADDING_OFFSET + SWA_PROJECTION_PADDING_COLS
 
 # fixture
 FIXTURE_ROUNDS = 2
@@ -158,6 +178,260 @@ def _prefill_cp_token_allgather_step(
 
 prefill_cp_token_allgather_step = pl.jit.inline(_prefill_cp_token_allgather_step)
 prefill_cp_token_allgather_fixture = pl.jit(_prefill_cp_token_allgather_step)
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_cp_projection_publish(
+    payload_local: pl.Tensor,
+    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
+    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
+    local_rows: pl.Scalar[pl.INDEX],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    pack_tid: pl.Scalar[pl.TASK_ID],
+    PAYLOAD_DIM: pl.constexpr,
+    PUSH_HINT: pl.constexpr,
+    ARRIVAL_HINT: pl.constexpr,
+) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+    """Publish packed rows and wait for remote payload arrivals."""
+    local_t = pl.cast(local_rows, pl.INT32)
+    target_row = tp_rank * local_t
+    with pl.spmd(TP_SIZE, name_hint=PUSH_HINT, deps=[pack_tid], allow_early_resolve=True) as push_tid:
+        peer_tp = pl.tile.get_block_idx()
+        pld.tensor.put(
+            dst=gather_window, peer=group_base + peer_tp, src=payload_local,
+            dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[local_t, PAYLOAD_DIM],
+            chunk_rows=COMM_ROW_TILE, chunk_cols=PAYLOAD_DIM, pipeline=True,
+        )
+        if peer_tp != tp_rank:
+            pld.system.notify(target=gather_signal, peer=group_base + peer_tp, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint=ARRIVAL_HINT) as payload_wait_tid:
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.defer_wait(signal=gather_signal, offsets=[source_tp, 0], expected=pl.cast(1, pl.INT32), cmp=pld.WaitCmp.Ge)
+
+    return push_tid, payload_wait_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_cp_projection_retire(
+    payload_local: pl.Tensor,
+    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    readback_tid: pl.Scalar[pl.TASK_ID],
+    PAYLOAD_DIM: pl.constexpr,
+    NOTIFY_HINT: pl.constexpr,
+    WAIT_HINT: pl.constexpr,
+    RETIRE_HINT: pl.constexpr,
+) -> pl.Scalar[pl.TASK_ID]:
+    """Acknowledge readback and retire the packed-row signal epoch."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint=NOTIFY_HINT, deps=[readback_tid]) as readback_notify_tid:
+        for peer_tp in pl.range(TP_SIZE):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=gather_signal, peer=group_base + peer_tp,
+                    offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint=WAIT_HINT) as readback_wait_tid:
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.defer_wait(signal=gather_signal, offsets=[source_tp, 0], expected=pl.cast(2, pl.INT32), cmp=pld.WaitCmp.Ge)
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint=RETIRE_HINT,
+        deps=[readback_notify_tid, readback_wait_tid],
+    ) as retire_tid:
+        completion_anchor = pl.read(payload_local, [0, PAYLOAD_DIM - 1])
+        reset_value = pl.cast(-2, pl.INT32)
+        for source_tp in pl.range(TP_SIZE):
+            if source_tp != tp_rank:
+                pld.system.notify(
+                    target=gather_signal, peer=group_base + tp_rank,
+                    offsets=[source_tp, 0], value=reset_value, op=pld.NotifyOp.AtomicAdd,
+                )
+        pl.write(payload_local, [0, PAYLOAD_DIM - 1], completion_anchor)
+
+    return retire_tid
+
+
+@pl.jit.inline
+def prefill_cp_hca_projection_allgather_step(
+    kv_local: pl.Tensor[[CP_Q_T_DYN, HCA_HEAD_DIM], pl.BF16],
+    cmp_values_local: pl.Tensor,
+    cmp_scores_local: pl.Tensor,
+    post_local: pl.Tensor[[CP_Q_T_DYN, HC_MULT], pl.FP32],
+    comb_local: pl.Tensor[[CP_Q_T_DYN, HC_COMB_DIM], pl.FP32],
+    kv_full: pl.Out[pl.Tensor[[CP_KV_T_DYN, HCA_HEAD_DIM], pl.BF16]],
+    cmp_values_full: pl.Out[pl.Tensor],
+    cmp_scores_full: pl.Out[pl.Tensor],
+    post_full: pl.Out[pl.Tensor[[CP_KV_T_DYN, HC_MULT], pl.FP32]],
+    comb_full: pl.Out[pl.Tensor[[CP_KV_T_DYN, HC_COMB_DIM], pl.FP32]],
+    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
+    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Gather raw KV, compressor projections and HC coefficients in one retired epoch."""
+    kv_local.bind_dynamic(0, CP_Q_T_DYN)
+    post_local.bind_dynamic(0, CP_Q_T_DYN)
+    comb_local.bind_dynamic(0, CP_Q_T_DYN)
+    kv_full.bind_dynamic(0, CP_KV_T_DYN)
+    post_full.bind_dynamic(0, CP_KV_T_DYN)
+    comb_full.bind_dynamic(0, CP_KV_T_DYN)
+    local_rows = pl.tensor.dim(kv_local, 0)
+    payload_local = pl.create_tensor([local_rows, HCA_PROJECTION_PAYLOAD_DIM], dtype=pl.BF16)
+    with pl.spmd((local_rows + COMM_ROW_TILE - 1) // COMM_ROW_TILE, name_hint="prefill_cp_hca_projection_pack") as pack_tid:
+        row = pl.tile.get_block_idx() * COMM_ROW_TILE
+        rows = pl.min(COMM_ROW_TILE, local_rows - row)
+        kv_tile = pl.load(kv_local, [row, 0], [COMM_ROW_TILE, HCA_HEAD_DIM], valid_shape=[rows, HCA_HEAD_DIM])
+        pl.store(kv_tile, [row, 0], payload_local)
+        values_tile = pl.load(cmp_values_local, [row, 0], [COMM_ROW_TILE, HCA_HEAD_DIM], valid_shape=[rows, HCA_HEAD_DIM])
+        values_bits = pl.reinterpret_view(values_tile, pl.BF16)
+        pl.store(values_bits, [row, HCA_PROJECTION_VALUES_OFFSET], payload_local)
+        scores_tile = pl.load(cmp_scores_local, [row, 0], [COMM_ROW_TILE, HCA_HEAD_DIM], valid_shape=[rows, HCA_HEAD_DIM])
+        scores_bits = pl.reinterpret_view(scores_tile, pl.BF16)
+        pl.store(scores_bits, [row, HCA_PROJECTION_SCORES_OFFSET], payload_local)
+        post_stage = pl.tile.full([COMM_ROW_TILE, HCA_POST_PAD_TILE], dtype=pl.FP32, value=0.0)
+        post_stage = pl.tile.gather_row(post_stage, post_local, [0, 0], [row, 0], [COMM_ROW_TILE, HC_MULT], valid_shape=[rows, HC_MULT])
+        post_valid = pl.set_validshape(post_stage, rows, HCA_POST_PAD_TILE)
+        post_bits = pl.reinterpret_view(post_valid, pl.BF16)
+        pl.store(post_bits, [row, HCA_PROJECTION_POST_OFFSET], payload_local)
+        comb_tile = pl.load(comb_local, [row, 0], [COMM_ROW_TILE, HC_COMB_DIM], valid_shape=[rows, HC_COMB_DIM])
+        comb_bits = pl.reinterpret_view(comb_tile, pl.BF16)
+        pl.store(comb_bits, [row, HCA_PROJECTION_COMB_OFFSET], payload_local)
+        padding = pl.tile.full([COMM_ROW_TILE, HCA_PROJECTION_PADDING_COLS], dtype=pl.BF16, value=0.0)
+        padding_valid = pl.set_validshape(padding, rows, HCA_PROJECTION_PADDING_COLS)
+        pl.store(padding_valid, [row, HCA_PROJECTION_PADDING_OFFSET], payload_local)
+
+    push_tid, payload_wait_tid = _prefill_cp_projection_publish(
+        payload_local, gather_window, gather_signal,
+        local_rows, group_base, tp_rank, pack_tid, HCA_PROJECTION_PAYLOAD_DIM,
+        "prefill_cp_hca_projection_allgather_push", "prefill_cp_hca_projection_allgather_payload_wait",
+    )
+
+    group_rows = TP_SIZE * local_rows
+    padded_group_rows = pl.tensor.dim(cmp_values_full, 0)
+    with pl.spmd(READBACK_WORKERS, name_hint="prefill_cp_hca_projection_allgather_readback", deps=[push_tid, payload_wait_tid]) as readback_tid:
+        unpack_worker = pl.tile.get_block_idx()
+        for unpack_row in pl.range(unpack_worker * COMM_ROW_TILE, group_rows, READBACK_WORKERS * COMM_ROW_TILE):
+            unpack_rows = pl.min(COMM_ROW_TILE, group_rows - unpack_row)
+            unpack_kv_tile = pl.load(gather_window, [unpack_row, 0], [COMM_ROW_TILE, HCA_HEAD_DIM], valid_shape=[unpack_rows, HCA_HEAD_DIM])
+            pl.store(unpack_kv_tile, [unpack_row, 0], kv_full)
+            unpack_values_bits = pl.load(
+                gather_window, [unpack_row, HCA_PROJECTION_VALUES_OFFSET], [COMM_ROW_TILE, 2 * HCA_HEAD_DIM],
+                valid_shape=[unpack_rows, 2 * HCA_HEAD_DIM],
+            )
+            unpack_values_tile = pl.reinterpret_view(unpack_values_bits, pl.FP32)
+            pl.store(unpack_values_tile, [unpack_row, 0], cmp_values_full)
+            unpack_scores_bits = pl.load(
+                gather_window, [unpack_row, HCA_PROJECTION_SCORES_OFFSET], [COMM_ROW_TILE, 2 * HCA_HEAD_DIM],
+                valid_shape=[unpack_rows, 2 * HCA_HEAD_DIM],
+            )
+            unpack_scores_tile = pl.reinterpret_view(unpack_scores_bits, pl.FP32)
+            pl.store(unpack_scores_tile, [unpack_row, 0], cmp_scores_full)
+            unpack_post_bits = pl.load(
+                gather_window, [unpack_row, HCA_PROJECTION_POST_OFFSET], [COMM_ROW_TILE, 2 * HCA_POST_PAD_TILE],
+                valid_shape=[unpack_rows, 2 * HCA_POST_PAD_TILE],
+            )
+            unpack_post_stage = pl.reinterpret_view(unpack_post_bits, pl.FP32)
+            unpack_post_valid = pl.set_validshape(unpack_post_stage, unpack_rows, HC_MULT)
+            pl.store(unpack_post_valid, [unpack_row, 0], post_full)
+            unpack_comb_bits = pl.load(
+                gather_window, [unpack_row, HCA_PROJECTION_COMB_OFFSET], [COMM_ROW_TILE, 2 * HC_COMB_DIM],
+                valid_shape=[unpack_rows, 2 * HC_COMB_DIM],
+            )
+            unpack_comb_tile = pl.reinterpret_view(unpack_comb_bits, pl.FP32)
+            pl.store(unpack_comb_tile, [unpack_row, 0], comb_full)
+        for unpack_row in pl.range(group_rows + unpack_worker * COMM_ROW_TILE, padded_group_rows, READBACK_WORKERS * COMM_ROW_TILE):
+            unpack_rows = pl.min(COMM_ROW_TILE, padded_group_rows - unpack_row)
+            unpack_projection_zero = pl.tile.full([COMM_ROW_TILE, HCA_HEAD_DIM], dtype=pl.FP32, value=0.0)
+            unpack_projection_zero_valid = pl.set_validshape(unpack_projection_zero, unpack_rows, HCA_HEAD_DIM)
+            pl.store(unpack_projection_zero_valid, [unpack_row, 0], cmp_values_full)
+            pl.store(unpack_projection_zero_valid, [unpack_row, 0], cmp_scores_full)
+
+    retire_tid = _prefill_cp_projection_retire(
+        payload_local, gather_signal, group_base, tp_rank, readback_tid, HCA_PROJECTION_PAYLOAD_DIM,
+        "prefill_cp_hca_projection_allgather_readback_notify", "prefill_cp_hca_projection_allgather_readback_wait",
+        "prefill_cp_hca_projection_allgather_retire",
+    )
+    return retire_tid
+
+
+@pl.jit.inline
+def prefill_cp_swa_projection_allgather_step(
+    kv_local: pl.Tensor[[CP_Q_T_DYN, HCA_HEAD_DIM], pl.BF16],
+    post_local: pl.Tensor[[CP_Q_T_DYN, HC_MULT], pl.FP32],
+    comb_local: pl.Tensor[[CP_Q_T_DYN, HC_COMB_DIM], pl.FP32],
+    kv_full: pl.Out[pl.Tensor[[CP_KV_T_DYN, HCA_HEAD_DIM], pl.BF16]],
+    post_full: pl.Out[pl.Tensor[[CP_KV_T_DYN, HC_MULT], pl.FP32]],
+    comb_full: pl.Out[pl.Tensor[[CP_KV_T_DYN, HC_COMB_DIM], pl.FP32]],
+    gather_window: pl.InOut[pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16]],
+    gather_signal: pl.InOut[pld.DistributedTensor[[TP_SIZE, 1], pl.INT32]],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Gather raw KV and HC coefficients in one retired epoch."""
+    kv_local.bind_dynamic(0, CP_Q_T_DYN)
+    post_local.bind_dynamic(0, CP_Q_T_DYN)
+    comb_local.bind_dynamic(0, CP_Q_T_DYN)
+    kv_full.bind_dynamic(0, CP_KV_T_DYN)
+    post_full.bind_dynamic(0, CP_KV_T_DYN)
+    comb_full.bind_dynamic(0, CP_KV_T_DYN)
+    local_rows = pl.tensor.dim(kv_local, 0)
+    payload_local = pl.create_tensor([local_rows, SWA_PROJECTION_PAYLOAD_DIM], dtype=pl.BF16)
+    with pl.spmd((local_rows + COMM_ROW_TILE - 1) // COMM_ROW_TILE, name_hint="prefill_cp_swa_projection_pack") as pack_tid:
+        row = pl.tile.get_block_idx() * COMM_ROW_TILE
+        rows = pl.min(COMM_ROW_TILE, local_rows - row)
+        kv_tile = pl.load(kv_local, [row, 0], [COMM_ROW_TILE, HCA_HEAD_DIM], valid_shape=[rows, HCA_HEAD_DIM])
+        pl.store(kv_tile, [row, 0], payload_local)
+        post_stage = pl.tile.full([COMM_ROW_TILE, HCA_POST_PAD_TILE], dtype=pl.FP32, value=0.0)
+        post_stage = pl.tile.gather_row(post_stage, post_local, [0, 0], [row, 0], [COMM_ROW_TILE, HC_MULT], valid_shape=[rows, HC_MULT])
+        post_valid = pl.set_validshape(post_stage, rows, HCA_POST_PAD_TILE)
+        post_bits = pl.reinterpret_view(post_valid, pl.BF16)
+        pl.store(post_bits, [row, SWA_PROJECTION_POST_OFFSET], payload_local)
+        comb_tile = pl.load(comb_local, [row, 0], [COMM_ROW_TILE, HC_COMB_DIM], valid_shape=[rows, HC_COMB_DIM])
+        comb_bits = pl.reinterpret_view(comb_tile, pl.BF16)
+        pl.store(comb_bits, [row, SWA_PROJECTION_COMB_OFFSET], payload_local)
+        padding = pl.tile.full([COMM_ROW_TILE, SWA_PROJECTION_PADDING_COLS], dtype=pl.BF16, value=0.0)
+        padding_valid = pl.set_validshape(padding, rows, SWA_PROJECTION_PADDING_COLS)
+        pl.store(padding_valid, [row, SWA_PROJECTION_PADDING_OFFSET], payload_local)
+
+    push_tid, payload_wait_tid = _prefill_cp_projection_publish(
+        payload_local, gather_window, gather_signal,
+        local_rows, group_base, tp_rank, pack_tid, SWA_PROJECTION_PAYLOAD_DIM,
+        "prefill_cp_swa_projection_allgather_push", "prefill_cp_swa_projection_allgather_payload_wait",
+    )
+
+    group_rows = TP_SIZE * local_rows
+    with pl.spmd(READBACK_WORKERS, name_hint="prefill_cp_swa_projection_allgather_readback", deps=[push_tid, payload_wait_tid]) as readback_tid:
+        unpack_worker = pl.tile.get_block_idx()
+        for unpack_row in pl.range(unpack_worker * COMM_ROW_TILE, group_rows, READBACK_WORKERS * COMM_ROW_TILE):
+            unpack_rows = pl.min(COMM_ROW_TILE, group_rows - unpack_row)
+            unpack_kv_tile = pl.load(gather_window, [unpack_row, 0], [COMM_ROW_TILE, HCA_HEAD_DIM], valid_shape=[unpack_rows, HCA_HEAD_DIM])
+            pl.store(unpack_kv_tile, [unpack_row, 0], kv_full)
+            unpack_post_bits = pl.load(
+                gather_window, [unpack_row, SWA_PROJECTION_POST_OFFSET], [COMM_ROW_TILE, 2 * HCA_POST_PAD_TILE],
+                valid_shape=[unpack_rows, 2 * HCA_POST_PAD_TILE],
+            )
+            unpack_post_stage = pl.reinterpret_view(unpack_post_bits, pl.FP32)
+            unpack_post_valid = pl.set_validshape(unpack_post_stage, unpack_rows, HC_MULT)
+            pl.store(unpack_post_valid, [unpack_row, 0], post_full)
+            unpack_comb_bits = pl.load(
+                gather_window, [unpack_row, SWA_PROJECTION_COMB_OFFSET], [COMM_ROW_TILE, 2 * HC_COMB_DIM],
+                valid_shape=[unpack_rows, 2 * HC_COMB_DIM],
+            )
+            unpack_comb_tile = pl.reinterpret_view(unpack_comb_bits, pl.FP32)
+            pl.store(unpack_comb_tile, [unpack_row, 0], comb_full)
+
+    retire_tid = _prefill_cp_projection_retire(
+        payload_local, gather_signal, group_base, tp_rank, readback_tid, SWA_PROJECTION_PAYLOAD_DIM,
+        "prefill_cp_swa_projection_allgather_readback_notify", "prefill_cp_swa_projection_allgather_readback_wait",
+        "prefill_cp_swa_projection_allgather_retire",
+    )
+    return retire_tid
 
 
 @pl.jit.host

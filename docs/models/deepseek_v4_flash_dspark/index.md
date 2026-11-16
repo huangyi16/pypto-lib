@@ -195,6 +195,51 @@ decode_csa   … → decode_compressor_ratio4 (main, inner)
   [prefill_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/prefill_cp_token_allgather.py)
   and [prefill_o_proj.py](../../../models/deepseek_v4_flash_dspark/prefill_o_proj.py).
 
+Context-parallel SWA prefill computes HC pre, RMS normalization, Q and raw KV
+on each token owner. A 576-column payload carries BF16 KV and lossless FP32
+HC coefficients through the existing 4096-column window. The gathered KV
+stream retains ordered physical-cache writers, and HC post produces the
+full replicated hidden state. SWA and HCA share the projection transport's
+payload-arrival and credit-retirement protocol.
+
+HCA prefill computes HC pre, RMS normalization, Q, raw KV and ratio-128
+compressor projections on each token owner. A 2624-column payload carries
+BF16 KV, lossless FP32 value/score bits, FP32 HC coefficients and padding
+through the existing 4096-column window. Pooling, checkpoint publication and
+cache/state updates consume the gathered rank-major stream on every rank.
+Ratio-128 pooling bulk-loads a complete current-tile window when its APE phase
+starts at zero. Windows touching history or wrapping APE retain row assembly.
+The payload epoch retires before the same window gathers output-projection
+rows; HC post still produces the full replicated hidden state. Single-chip
+HCA composes the same projection and state-update kernels without transport.
+
+HCA prefill loads each raw-window index row once and stages contiguous runs
+of 32 physical KV rows together. Fragmented runs retain row-wise gathers,
+negative indices remain masked, and inactive query rows are zero-filled.
+Raw QK/PV pipelines queries across 24 workers, and compressed QK/PV batches
+64 heads. Inverse RoPE reuses the prepared pair-swap indices for a vector
+gather when merging the raw and compressed attention statistics.
+Each merge worker handles four 16-head chunks in sequence.
+
+CSA compressed-KV gathers load directly into zero-initialized on-chip row
+slots, retaining selected-key order and invalid-row masking.
+Indexer query Hadamard and per-head INT8 quantization share one persistent
+mixed kernel. It retains FP32 Hadamard outputs, ordered 32-column maximum
+reductions, and the existing INT32-to-FP16-to-INT8 cast sequence.
+
+Prefill output projection writes through column views for each O-A fragment
+and O-B slab. Each task exposes its output interval to dependency tracking;
+quantization still waits for every fragment in its group, and dequantization
+waits for all O-B slabs.
+
+Single-chip SWA builds window metadata in four-query tasks and assigns each
+physical cache row to one of 32 writers, preserving token order for duplicate
+slots. Dummy compressed indices use eight-query tasks in both single-chip and
+context-parallel SWA.
+
+The [paired v2 performance evidence](prefill-attention-v2-performance.md)
+records the measured source snapshot, validation limits and raw timing samples.
+
 ### MoE and output stages
 
 [moe.py](../../../models/deepseek_v4_flash_dspark/moe.py) is unchanged in shape
