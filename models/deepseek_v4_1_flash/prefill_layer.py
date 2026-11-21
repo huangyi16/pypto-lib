@@ -30,11 +30,11 @@ LOCAL_CAPACITY = max(
     + max(0, min(_chunk, _shape_options.tokens - (2 * C.CP_SIZE - 1 - rank) * _chunk))
     for rank in range(C.CP_SIZE)
 )
-C.set_moe_tokens(min((LOCAL_CAPACITY + 15) // 16 * 16, _shape_options.moe_tokens))
+C.set_prefill_moe_tokens(min((LOCAL_CAPACITY + 15) // 16 * 16, _shape_options.moe_tokens))
 
 from config import (
     FLASH as M, CP_SIZE, EP_SIZE, RANKS_DYN, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN,
-    ROUTE_T_DYN, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES, MOE_TOKENS,
+    ROUTE_T_DYN, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES, PREFILL_MOE_TOKENS as MOE_TOKENS,
 )
 from prefill_c1a_reuse import (
     l2_prefill_c1a_reuse, l2_prefill_c1a_reuse_cp, l3_prefill_c1a_reuse, l3_prefill_c1a_reuse_cp,
@@ -117,15 +117,20 @@ def l2_prefill_layer_ffn(
         for row in pl.range(worker, capacity, 32):
             ffn_input[row:row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
     active = pl.read(num_tokens, [0])
+    group_rounds = (LOCAL_CAPACITY + MOE_TOKENS - 1) // MOE_TOKENS
+    unused_trace = pl.create_tensor([1, 16], dtype=pl.FP32)
+    unused_scale = pl.create_tensor([1, 128], dtype=pl.FP8E8M0)
     completed = prefill_moe_slabs(
         hc_output, hc_next_pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, w_ffn_norm,
         gate_weight, correction_bias,
         routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
         shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
         next_pre_mix, ffn_input, output,
-        recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+        recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        recv_scale, unused_scale, unused_scale, unused_scale, unused_trace, arrived, data_arrived,
         routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
-        initialized, active, ep_rank, moe_epoch, capacity=LOCAL_CAPACITY,
+        initialized, active, ep_rank, moe_epoch, group_rounds, capacity=LOCAL_CAPACITY,
+        moonep_layout=0, copy_cost_tiles=0, trace_mode=0,
     )
     clear_moe_signals(output, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return output

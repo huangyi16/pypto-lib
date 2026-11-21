@@ -57,11 +57,17 @@ AICORE inline void copyRouteWeights(__gm__ float* input, __gm__ float* output, i
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
     auto* counts = tensorData<int32_t>(args, 2);
-    const int64_t experts = args[10];
-    const int64_t stride = args[11];
-    const int64_t width = args[12];
-    const int64_t hidden = args[13];
-    const int64_t activationRows = args[14];
+    auto* inputStarts = tensorData<int32_t>(args, 10);
+    const int64_t experts = args[12];
+    const int64_t stride = args[13];
+    const int64_t width = args[14];
+    const int64_t hidden = args[15];
+    const int64_t activationRows = args[16];
+    const int64_t inputRows = args[17];
+    const int64_t homeExperts = args[18];
+    auto* replica = experts > homeExperts ? tensorData<uint8_t>(args, 11) : nullptr;
+    const int64_t weightBytes = width * hidden / 2;
+    const int64_t scaleBytes = width * hidden / 32;
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
     const int64_t hTiles = hidden / N_TILE;
@@ -81,6 +87,9 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     int64_t activationBase = 0;
     for (int64_t expert = 0; expert < experts; ++expert) {
         const int64_t count = acquireCount(counts, expert);
+        const bool isReplica = expert >= homeExperts;
+        const int64_t weightExpert = isReplica ? 0 : expert;
+        const int64_t inputBase = stride == 0 ? acquireCount(inputStarts, expert) : expert * stride;
         const int64_t workCount = ((count + M_TILE - 1) / M_TILE) * 2 * hTiles;
         const int64_t first = (block + blocks - workBase % blocks) % blocks;
         for (int64_t work = first; work < workCount; work += blocks) {
@@ -90,15 +99,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
             const int64_t valid = count - row < M_TILE ? count - row : M_TILE;
 #ifdef __DAV_VEC__
             if (work % (2 * hTiles) == 0 && get_subblockid() == 0) {
-                copyRouteWeights(tensorData<float>(args, 8) + expert * stride + row,
+                copyRouteWeights(tensorData<float>(args, 8) + inputBase + row,
                                  tensorData<float>(args, 9) + activationBase + row, valid);
             }
-            produceWeight(up ? w3 : w1, width, hidden, expert, col);
+            auto* weight = isReplica ? replica + (up ? weightBytes : 0) : (up ? w3 : w1);
+            produceWeight(weight, width, hidden, weightExpert, col);
 #endif
 #ifdef __DAV_CUBE__
-            const Chunk chunk{expert, expert * stride + row, valid};
-            computeProjection<M_TILE>(x, xScale, up ? s3 : s1, width, hidden, experts,
-                                      experts * stride, chunk, col,
+            const Chunk chunk{weightExpert, inputBase + row, valid};
+            auto* scale = isReplica
+                ? reinterpret_cast<__gm__ float8_e8m0_t*>(replica + 3 * weightBytes + (up ? scaleBytes : 0))
+                : (up ? s3 : s1);
+            computeProjection<M_TILE>(x, xScale, scale, width, hidden, isReplica ? 1 : homeExperts,
+                                      inputRows, chunk, col,
                                       StorePair{out, activationRows, 2 * hidden,
                                                 activationBase + row,
                                                 col + (up ? hidden : 0)});

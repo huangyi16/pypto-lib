@@ -313,9 +313,18 @@ def set_moe_tokens(tokens: int) -> None:
     MOE_RECV_MAX = EP_SIZE * tokens
 
 
+def set_prefill_moe_tokens(tokens: int) -> None:
+    """Set the Prefill extent before importing its shape-specific kernels."""
+    if tokens <= 0 or tokens % 16:
+        raise ValueError(f"Prefill MoE tokens must be positive and divisible by 16, got {tokens}")
+    global PREFILL_MOE_TOKENS
+    PREFILL_MOE_TOKENS = tokens
+
+
 # Shared MoE deployment dimensions
 N_LOCAL_EXPERTS = FLASH.n_routed_experts // EP_SIZE
 MOE_TOKENS = (DECODE_MAX_TOKENS + 15) // 16 * 16
 MOE_RECV_MAX = EP_SIZE * MOE_TOKENS
+PREFILL_MOE_TOKENS = MOE_TOKENS
 # Input gather publishes each rank's complete padded physical slab.
 DECODE_INPUT_MAX_TOKENS = max(DECODE_MAX_TOKENS, MOE_TOKENS)

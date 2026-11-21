@@ -40,12 +40,15 @@ struct StoreOutput {
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
     auto* counts = tensorData<int32_t>(args, 2);
-    const int64_t experts = args[6];
-    const int64_t stride = args[7];
-    const int64_t width = args[8];
-    const int64_t hidden = args[9];
-    const int64_t outputRows = args[10];
-    const int64_t activationRows = args[11];
+    const int64_t experts = args[7];
+    const int64_t width = args[9];
+    const int64_t hidden = args[10];
+    const int64_t outputRows = args[11];
+    const int64_t activationRows = args[12];
+    const int64_t homeExperts = args[13];
+    auto* replica = experts > homeExperts ? tensorData<uint8_t>(args, 6) : nullptr;
+    const int64_t weightBytes = width * hidden / 2;
+    const int64_t scaleBytes = width * hidden / 32;
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
     const int64_t nTiles = width / N_TILE;
@@ -64,6 +67,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     int64_t workBase = 0;
     for (int64_t expert = 0; expert < experts; ++expert) {
         const int64_t count = acquireCount(counts, expert);
+        const bool isReplica = expert >= homeExperts;
+        const int64_t weightExpert = isReplica ? 0 : expert;
         const int64_t workCount = ((count + M_TILE - 1) / M_TILE) * nTiles;
         const int64_t first = (block + blocks - workBase % blocks) % blocks;
         for (int64_t work = first; work < workCount; work += blocks) {
@@ -71,11 +76,15 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
             const int64_t col = work % nTiles * N_TILE;
             const int64_t valid = count - row < M_TILE ? count - row : M_TILE;
 #ifdef __DAV_VEC__
-            produceWeight(weight, hidden, width, expert, col);
+            auto* weightBase = isReplica ? replica + 2 * weightBytes : weight;
+            produceWeight(weightBase, hidden, width, weightExpert, col);
 #endif
 #ifdef __DAV_CUBE__
-            const Chunk chunk{expert, activationBase + row, valid};
-            computeProjection<M_TILE>(x, xScale, weightScale, hidden, width, experts,
+            const Chunk chunk{weightExpert, activationBase + row, valid};
+            auto* scale = isReplica
+                ? reinterpret_cast<__gm__ float8_e8m0_t*>(replica + 3 * weightBytes + 2 * scaleBytes)
+                : weightScale;
+            computeProjection<M_TILE>(x, xScale, scale, hidden, width, isReplica ? 1 : homeExperts,
                                       activationRows, chunk, col,
                                       StoreOutput{out, width, outputRows, compactBase + row, col});
 #endif

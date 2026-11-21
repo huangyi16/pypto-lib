@@ -32,7 +32,7 @@ def _parse_int_option(flag, default):
 
 
 if __name__ == "__main__":
-    config.set_moe_tokens(_parse_int_option("--tokens", 48))
+    config.set_prefill_moe_tokens(_parse_int_option("--tokens", 48))
     config.N_LOCAL_EXPERTS = _parse_int_option("--experts-per-rank", 12)
     total_experts = config.EP_SIZE * config.N_LOCAL_EXPERTS
     if config.N_LOCAL_EXPERTS <= 0 or not config.FLASH.num_experts_per_tok <= total_experts <= 384:
@@ -40,15 +40,16 @@ if __name__ == "__main__":
     config.FLASH = replace(config.FLASH, n_routed_experts=total_experts)
 
 
+from prefill_moonep import COMPACT_ROWS, REPLICA_COMPACT_ROWS, REPLICA_ROWS, S13_ROWS, WEIGHT_COLS, dispatch_direct, expert_direct_scatter
 from config import FLASH as M
 from config import EP_SIZE, SUPPORTED_EP_SIZES
-from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
+from config import PREFILL_MOE_TOKENS as MOE_TOKENS, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
 from config import T_DYN
-from gate import gate_from_bf16
-from expert_shared import expert_shared
+from gate import make_gate
+from expert_shared import make_shared_expert
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
-    expert_routed_scatter,
+    expert_routed_scatter, routed_worker_counts,
 )
 from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
 from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
@@ -72,12 +73,20 @@ _entry_parser.add_argument("--entry", choices=("local", "slabs"), default="slabs
 _entry_parser.add_argument("--slab-capacity", type=int, default=(2 * MOE_TOKENS + 16))
 _entry_options = _entry_parser.parse_known_args()[0]
 VALIDATE_SLABS = _entry_options.entry == "slabs"
+VALIDATION_LAYOUT_NAMES = ("native", "fixed", "compact", "online")
+VALIDATION_COPY_COST = _parse_int_option("--moonep-copy-cost-tiles", 2)
+VALIDATION_LAYOUT = 0
+if __name__ == "__main__":
+    _entry_parser.add_argument("--moonep-layout", choices=VALIDATION_LAYOUT_NAMES, default="native")
+    VALIDATION_LAYOUT = VALIDATION_LAYOUT_NAMES.index(_entry_parser.parse_known_args()[0].moonep_layout)
+    if VALIDATION_LAYOUT and not VALIDATE_SLABS:
+        _entry_parser.error("MoonEP validation requires --entry slabs")
 SLAB_CAPACITY = _entry_options.slab_capacity
 VALIDATION_TOKENS = SLAB_CAPACITY if VALIDATE_SLABS else MOE_TOKENS
 
 
 # EP transport layout
-RECV_MAX = MOE_RECV_MAX
+RECV_MAX = EP_SIZE * MOE_TOKENS
 AUX_WIDTH = 8
 ROUTE_WIDTH = 8
 T = MOE_TOKENS
@@ -89,11 +98,22 @@ MAX_PER_SRC = T
 AUX_W = 0
 AUX_PAD = AUX_WIDTH
 IDX_PAD = ROUTE_WIDTH
+VALIDATION_RECV_ROWS = N_LOCAL * RECV_MAX
+if VALIDATION_LAYOUT == 2:
+    VALIDATION_RECV_ROWS = COMPACT_ROWS
+elif VALIDATION_LAYOUT == 3:
+    VALIDATION_RECV_ROWS = REPLICA_COMPACT_ROWS
+VALIDATION_HIST = N_EXPERTS if VALIDATION_LAYOUT else N_LOCAL
+VALIDATION_BANK = REPLICA_ROWS if VALIDATION_LAYOUT == 3 else 16
+TRACE_WIDTH = 16
 SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
 SCALE_PACK_TMP_TILE = 2 * ((K_SCALE + 63) // 32) * 32
 RECV_GATHER_TILE = 32
+ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE = routed_worker_counts(MOE_TOKENS)
+expert_shared = make_shared_expert(MOE_TOKENS)
+gate_from_bf16 = make_gate(MOE_TOKENS)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -111,10 +131,26 @@ def clear_moe_signals(
         for peer in pl.range(EP_SIZE):
             pl.write(arrived, [peer, 0], zero)
             pl.write(data_arrived, [peer, 0, 0], zero)
+            pl.write(data_arrived, [peer, 1, 0], zero)
             pl.write(combine_arrived, [peer, 0, 0], zero)
             pl.write(combine_arrived, [peer, 1, 0], zero)
         pl.write(completion_anchor, anchor_indices, anchor)
     return completion_anchor
+
+
+@pl.jit.inline(auto_scope=False)
+def unpack_moe_scale(x_norm_scale: pl.Tensor, num_tokens: pl.Scalar[pl.INT32]):
+    scale_src = pl.create_tensor([T, K_SCALE], dtype=pl.UINT8, manual_dep=True)
+    with pl.spmd(32, name_hint="dispatch_scale_unpack") as _stage_tid:
+        worker = pl.tile.get_block_idx()
+        for first in pl.range(worker * 16, num_tokens, 32 * 16):
+            packed = pl.load(x_norm_scale, [0, first * K_SCALE], [1, 16 * K_SCALE])
+            scale_bytes = pl.reinterpret_view(packed, pl.UINT8)
+            pairs = pl.reinterpret_view(scale_bytes, pl.UINT16, shape=[K_SCALE // 2, 16])
+            pairs_nd = pl.transpose(pairs, 0, 1)
+            bytes_nd = pl.reinterpret_view(pairs_nd, pl.UINT8, shape=[16, K_SCALE])
+            pl.store(bytes_nd, [first, 0], scale_src)
+    return scale_src, _stage_tid
 
 
 @pl.jit.inline
@@ -140,16 +176,7 @@ def dispatch(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    scale_src = pl.create_tensor([T, K_SCALE], dtype=pl.UINT8, manual_dep=True)
-    with pl.spmd(32, name_hint="dispatch_scale_unpack") as _stage_tid:
-        worker = pl.tile.get_block_idx()
-        for first in pl.range(worker * 16, num_tokens, 32 * 16):
-            packed = pl.load(x_norm_scale, [0, first * K_SCALE], [1, 16 * K_SCALE])
-            scale_bytes = pl.reinterpret_view(packed, pl.UINT8)
-            pairs = pl.reinterpret_view(scale_bytes, pl.UINT16, shape=[K_SCALE // 2, 16])
-            pairs_nd = pl.transpose(pairs, 0, 1)
-            bytes_nd = pl.reinterpret_view(pairs_nd, pl.UINT8, shape=[16, K_SCALE])
-            pl.store(bytes_nd, [first, 0], scale_src)
+    scale_src, _stage_tid = unpack_moe_scale(x_norm_scale, num_tokens)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait") as _reuse_tid:
         _indices_anchor = pl.read(indices, [0, 0])
 
@@ -374,11 +401,18 @@ def prefill_moe(
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_scale: pld.DistributedTensor,
+    recv_weights: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    replica_bank: pld.DistributedTensor,
+    raw_s1: pl.Tensor,
+    raw_s3: pl.Tensor,
+    raw_s2: pl.Tensor,
+    replica_cached: pl.Tensor,
+    route_trace: pl.Tensor,
+    trace_start: pl.Scalar[pl.INDEX],
     arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
@@ -386,6 +420,9 @@ def prefill_moe(
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    moonep_layout: pl.constexpr,
+    copy_cost_tiles: pl.constexpr,
+    trace_mode: pl.constexpr,
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed HC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
@@ -413,7 +450,22 @@ def prefill_moe(
             ffn_input, gate_weight, correction_bias, num_tokens,
             x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
         )
-        dispatch_indices = indices
+        if trace_mode == 1:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="record_prefill_routes"):
+                for token in pl.range(num_tokens):
+                    for k in pl.range(TOPK):
+                        expert = pl.read(indices, [token, k])
+                        weight = pl.read(weights, [token, k])
+                        pl.write(route_trace, [trace_start + token, k], pl.cast(expert, pl.FP32))
+                        pl.write(route_trace, [trace_start + token, TOPK + k], weight)
+        elif trace_mode == 2:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="replay_prefill_routes"):
+                for token in pl.range(num_tokens):
+                    for k in pl.range(TOPK):
+                        expert = pl.read(route_trace, [trace_start + token, k])
+                        weight = pl.read(route_trace, [trace_start + token, TOPK + k])
+                        pl.write(indices, [token, k], pl.cast(expert, pl.INT32))
+                        pl.write(weights, [token, k], weight)
 
         shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
         shared_result = expert_shared(
@@ -424,29 +476,58 @@ def prefill_moe(
             shared_output,
         )
 
-        recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-        # Contiguous ND backing for the routed-expert MX_A_ZZ view.
-        recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
-        recv_weight_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
-        recv_route_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
-        recv_count_local = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
-        recv_meta_local = pl.create_tensor([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        input_ready = dispatch(
-            dispatch_indices, x_norm_mx, x_norm_scale, weights,
-            recv_x_local, recv_scale_local_backing,
-            recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-            arrived, data_arrived, num_tokens, ep_rank, moe_epoch,
-        )
+        if moonep_layout > 0:
+            physical_rows = N_LOCAL_EXPERTS * RECV_MAX
+            if moonep_layout == 2:
+                physical_rows = COMPACT_ROWS
+            elif moonep_layout >= 3:
+                physical_rows = REPLICA_COMPACT_ROWS
+            execution_slots = N_LOCAL_EXPERTS
+            if moonep_layout >= 3:
+                execution_slots = N_LOCAL_EXPERTS + 1
+            scale_rows, scale_ready = unpack_moe_scale(x_norm_scale, num_tokens)
+            starts = pl.create_tensor([execution_slots], dtype=pl.INT32)
+            counts = pl.create_tensor([execution_slots, 1], dtype=pl.INT32)
+            packed_scale = pl.create_tensor([1, physical_rows * K_SCALE], dtype=pl.FP8E8M0)
+            packed_weights = pl.create_tensor([physical_rows, 1], dtype=pl.FP32)
+            direct_ready = dispatch_direct(
+                indices, x_norm_mx, scale_rows, weights,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+                counts, starts, packed_scale, packed_weights,
+                replica_bank, replica_cached, route_trace, trace_start,
+                routed_w1, raw_s1, routed_w3, raw_s3, routed_w2, raw_s2,
+                scale_ready, num_tokens, ep_rank, moe_epoch, moonep_layout, copy_cost_tiles, trace_mode,
+            )
+            scatter_done = expert_direct_scatter(
+                recv_x, packed_scale, packed_weights, counts, starts,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                recv_routes, routed_output, replica_bank, direct_ready, execution_slots,
+            )
+        else:
+            recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
+            # Contiguous ND backing for the routed-expert MX_A_ZZ view.
+            recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
+            recv_weight_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
+            recv_route_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
+            recv_count_local = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
+            recv_meta_local = pl.create_tensor([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
+            input_ready = dispatch(
+                indices, x_norm_mx, x_norm_scale, weights,
+                recv_x_local, recv_scale_local_backing,
+                recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+                arrived, data_arrived, num_tokens, ep_rank, moe_epoch,
+            )
 
-        scatter_done = expert_routed_scatter(
-            recv_x_local, recv_scale_local_backing,
-            recv_weight_local, recv_count_local,
-            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            routed_w2, routed_w2_scale,
-            recv_route_local, recv_meta_local,
-            routed_output, input_ready, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
-        )
+            scatter_done = expert_routed_scatter(
+                recv_x_local, recv_scale_local_backing,
+                recv_weight_local, recv_count_local,
+                routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+                routed_w2, routed_w2_scale,
+                recv_route_local, recv_meta_local,
+                routed_output, input_ready, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+                recv_max=RECV_MAX, cube_workers=ROUTED_CUBE_WORKER_TILE, vector_workers=ROUTED_VECTOR_WORKER_TILE,
+            )
         output_ready = combine_scattered(
             shared_result, sublayer,
             routed_output, combine_arrived,
@@ -518,17 +599,16 @@ def prefill_moe_slabs(
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
     x_next: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[
-        [N_LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8
-    ],
-    recv_weights: pld.DistributedTensor[
-        [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32
-    ],
-    recv_routes: pld.DistributedTensor[
-        [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
-    ],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_scale: pld.DistributedTensor,
+    recv_weights: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    replica_bank: pld.DistributedTensor,
+    raw_s1: pl.Tensor,
+    raw_s3: pl.Tensor,
+    raw_s2: pl.Tensor,
+    route_trace: pl.Tensor,
     arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
@@ -545,18 +625,27 @@ def prefill_moe_slabs(
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    group_rounds: pl.Scalar[pl.INT32],
     capacity: pl.constexpr,
+    moonep_layout: pl.constexpr,
+    copy_cost_tiles: pl.constexpr,
+    trace_mode: pl.constexpr,
 ):
     """Run bounded MoE slabs and return completion of every scratch reader."""
     source_hidden = pl.reshape(x_hc, [capacity, HC_DIM])
     round_completion = pl.array.create(1, pl.TASK_ID)
     round_completion[0] = reuse_ready
-    owner_capacity = capacity
-    owner_begin = 0
-    rounds = (owner_capacity + MOE_TOKENS - 1) // MOE_TOKENS
-    for round_id in pl.range(rounds):
-        begin = owner_begin + round_id * MOE_TOKENS
-        rows = pl.min(MOE_TOKENS, owner_begin + owner_capacity - begin)
+    replica_cached = pl.create_tensor([2], dtype=pl.INT32)
+    if moonep_layout >= 3:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moonep_reset_slots", deps=[reuse_ready]) as reset_slots:
+            pl.write(replica_cached, [0], pl.cast(-1, pl.INT32))
+            pl.write(replica_cached, [1], pl.cast(-1, pl.INT32))
+        round_completion[0] = reset_slots
+    # Keep the epoch stride fixed across stages with different round limits.
+    max_rounds = (capacity + MOE_TOKENS - 1) // MOE_TOKENS
+    for round_id in pl.range(group_rounds):
+        begin = round_id * MOE_TOKENS
+        rows = pl.min(MOE_TOKENS, capacity - begin)
         # Keep caller-owned destinations outside the slab allocation scope.
         hidden_destination = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
         mixed_destination = pl.slice(x_mixed, [rows, D], [begin, 0])
@@ -580,15 +669,16 @@ def prefill_moe_slabs(
             packed_hidden = pl.reshape(round_hidden, [MOE_TOKENS, HC_DIM])
             gather_rows(source_hidden, row_ids, packed_hidden, rows_ready, column_tile=D)
             gather_rows(pre_mix, row_ids, round_pre, rows_ready, column_tile=512)
-            epoch = (moe_epoch - 1) * rounds + round_id + 1
+            epoch = (moe_epoch - 1) * max_rounds + round_id + 1
             prefill_moe(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                 gate_weight, correction_bias,
                 routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 round_next, round_mixed, round_output,
-                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
-                routed_output, combine_arrived, active, ep_rank, epoch,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+                replica_bank, raw_s1, raw_s3, raw_s2, replica_cached, route_trace, begin, arrived, data_arrived,
+                routed_output, combine_arrived, active, ep_rank, epoch, moonep_layout, copy_cost_tiles, trace_mode,
             )
             with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
                 worker = pl.tile.get_block_idx()
@@ -656,6 +746,9 @@ def l2_prefill_moe(
     x_mixed.bind_dynamic(0, LOCAL_T_DYN)
     x_next.bind_dynamic(0, LOCAL_T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
+    unused_cache = pl.create_tensor([2], dtype=pl.INT32)
+    unused_trace = pl.create_tensor([1, TRACE_WIDTH], dtype=pl.FP32)
+    unused_scale = pl.create_tensor([1, WEIGHT_COLS], dtype=pl.FP8E8M0)
     prefill_moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
@@ -664,8 +757,9 @@ def l2_prefill_moe(
         shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        recv_scale, unused_scale, unused_scale, unused_scale, unused_cache, unused_trace, 0,
         arrived, data_arrived, routed_output, combine_arrived,
-        local_num_tokens, ep_rank, moe_epoch,
+        local_num_tokens, ep_rank, moe_epoch, 0, 0, 0,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_next
@@ -696,11 +790,15 @@ def l2_prefill_moe_slabs(
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    recv_meta: pld.DistributedTensor[[EP_SIZE, VALIDATION_HIST], pl.INT32],
+    recv_x: pld.DistributedTensor[[VALIDATION_RECV_ROWS, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[VALIDATION_RECV_ROWS, D // MX_GROUP], pl.UINT8],
+    recv_weights: pld.DistributedTensor[[VALIDATION_RECV_ROWS, AUX_WIDTH], pl.FP32],
+    recv_routes: pld.DistributedTensor[[VALIDATION_RECV_ROWS, ROUTE_WIDTH], pl.INT32],
+    replica_bank: pld.DistributedTensor[[VALIDATION_BANK, WEIGHT_COLS], pl.UINT8],
+    raw_s1: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    raw_s3: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    raw_s2: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
@@ -720,15 +818,22 @@ def l2_prefill_moe_slabs(
         for row in pl.range(worker, capacity, 32):
             x_mixed[row:row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
     active = pl.read(num_tokens, [ep_rank])
+    group_rounds = (SLAB_CAPACITY + MOE_TOKENS - 1) // MOE_TOKENS
+    unused_trace = pl.create_tensor([1, TRACE_WIDTH], dtype=pl.FP32)
+    flat_s1 = pl.reshape(raw_s1, [N_LOCAL_EXPERTS * S13_ROWS, WEIGHT_COLS])
+    flat_s3 = pl.reshape(raw_s3, [N_LOCAL_EXPERTS * S13_ROWS, WEIGHT_COLS])
+    flat_s2 = pl.reshape(raw_s2, [N_LOCAL_EXPERTS * S13_ROWS, WEIGHT_COLS])
     completed = prefill_moe_slabs(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
         gate_weight, correction_bias,
         routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
         shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
         next_pre_mix, x_mixed, x_next,
-        recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+        recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        replica_bank, flat_s1, flat_s3, flat_s2, unused_trace, arrived, data_arrived,
         routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
-        initialized, active, ep_rank, moe_epoch, capacity=SLAB_CAPACITY,
+        initialized, active, ep_rank, moe_epoch, group_rounds, capacity=SLAB_CAPACITY,
+        moonep_layout=VALIDATION_LAYOUT, copy_cost_tiles=VALIDATION_COPY_COST, trace_mode=0,
     )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_slabs_complete", deps=[completed]):
         anchor = pl.read(x_next, [0, 0, 0])
@@ -766,11 +871,12 @@ def l3_prefill_moe(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """EP host driver for the HC-wrapped Flash MoE block."""
-    recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-    recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-    recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+    recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, VALIDATION_HIST], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([VALIDATION_RECV_ROWS, D], dtype=pl.INT8)
+    recv_scale_buf = pld.alloc_window_buffer([VALIDATION_RECV_ROWS, D // MX_GROUP], dtype=pl.UINT8)
+    recv_weights_buf = pld.alloc_window_buffer([VALIDATION_RECV_ROWS, AUX_WIDTH], dtype=pl.FP32)
+    recv_routes_buf = pld.alloc_window_buffer([VALIDATION_RECV_ROWS, ROUTE_WIDTH], dtype=pl.INT32)
+    replica_buf = pld.alloc_window_buffer([VALIDATION_BANK, WEIGHT_COLS], dtype=pl.UINT8)
     arrived_buf = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     routed_output_buf = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
@@ -779,11 +885,12 @@ def l3_prefill_moe(
     rank_count = pld.world_size()
     if VALIDATE_SLABS:
         for r in pl.range(rank_count):
-            recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-            recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-            recv_scale = pld.window(recv_scale_buf, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-            recv_weights = pld.window(recv_weights_buf, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-            recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+            recv_meta = pld.window(recv_meta_buf, [EP_SIZE, VALIDATION_HIST], dtype=pl.INT32)
+            recv_x = pld.window(recv_x_buf, [VALIDATION_RECV_ROWS, D], dtype=pl.INT8)
+            recv_scale = pld.window(recv_scale_buf, [VALIDATION_RECV_ROWS, D // MX_GROUP], dtype=pl.UINT8)
+            recv_weights = pld.window(recv_weights_buf, [VALIDATION_RECV_ROWS, AUX_WIDTH], dtype=pl.FP32)
+            recv_routes = pld.window(recv_routes_buf, [VALIDATION_RECV_ROWS, ROUTE_WIDTH], dtype=pl.INT32)
+            replica_bank = pld.window(replica_buf, [VALIDATION_BANK, WEIGHT_COLS], dtype=pl.UINT8)
             arrived = pld.window(arrived_buf, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
             data_arrived = pld.window(data_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
             routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
@@ -809,6 +916,7 @@ def l3_prefill_moe(
                 shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
                 next_pre_mix[r], x_mixed[r], x_next[r],
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+                replica_bank, routed_w1_scale[r], routed_w3_scale[r], routed_w2_scale[r],
                 arrived, data_arrived, routed_output, combine_arrived,
                 num_tokens, r, moe_epoch, device=r,
             )
@@ -1336,6 +1444,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--entry", choices=("local", "slabs"), default=_entry_options.entry)
     parser.add_argument("--slab-capacity", type=int, default=SLAB_CAPACITY)
+    parser.add_argument("--moonep-layout", choices=VALIDATION_LAYOUT_NAMES, default="native")
+    parser.add_argument("--moonep-copy-cost-tiles", type=int, default=VALIDATION_COPY_COST)
+    parser.add_argument("--route-case", choices=("spread", "hot"), default="spread")
     parser.add_argument("--tokens", type=int, default=MOE_TOKENS)
     parser.add_argument("--num-tokens", type=int, default=SLAB_CAPACITY - 1 if VALIDATE_SLABS else MOE_TOKENS)
     parser.add_argument(
@@ -1364,6 +1475,10 @@ if __name__ == "__main__":
             "with the desired values, for example `python models/deepseek_v4_1_flash/prefill_moe.py --ep 8 ...`"
         )
 
+    if args.moonep_copy_cost_tiles < 0:
+        parser.error("--moonep-copy-cost-tiles must be nonnegative")
+    if args.route_case == "hot" and N_LOCAL_EXPERTS < TOPK:
+        parser.error("the hot route fixture requires at least TopK experts per rank")
     entry = l3_prefill_moe
     if args.num_tokens_per_rank is None:
         count_value = args.num_tokens
@@ -1401,6 +1516,11 @@ if __name__ == "__main__":
             "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "x_next": _local_hc_compare(counts),
         }
+
+    if args.route_case == "hot":
+        bias = torch.full((EP_SIZE, N_EXPERTS), -1.0, dtype=torch.float32)
+        bias[:, :TOPK] = 4.0
+        next(spec for spec in specs if spec.name == "correction_bias").init_value = bias
 
     result = run(
         fn=entry,

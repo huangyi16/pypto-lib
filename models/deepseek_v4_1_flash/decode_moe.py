@@ -41,6 +41,7 @@ from expert_shared import expert_shared
 from expert_routed import (
     dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
+    ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE,
 )
 from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
 
@@ -235,6 +236,7 @@ def moe(
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
             routed_output, input_ready, local_experts=local_experts, topk=topk,
+            recv_max=RECV_MAX, cube_workers=ROUTED_CUBE_WORKER_TILE, vector_workers=ROUTED_VECTOR_WORKER_TILE,
         )
         sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
         output_ready = combine_scattered(

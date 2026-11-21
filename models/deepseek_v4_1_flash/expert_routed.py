@@ -47,10 +47,14 @@ if __name__ == "__main__":
 from config import FLASH as M
 from config import EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
 from config import N_LOCAL_EXPERTS, MOE_TOKENS
-
-ROUTED_CUBE_WORKER_TILE = 28 if MOE_TOKENS > 80 else 32
-ROUTED_VECTOR_WORKER_TILE = 32 if MOE_TOKENS > 80 else 64
 from quant import pack_mxfp4_weight_tiles, unpack_mxfp4_weight_tiles
+
+
+def routed_worker_counts(tokens):
+    return (28, 32) if tokens > 80 else (32, 64)
+
+
+ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE = routed_worker_counts(MOE_TOKENS)
 
 
 # model config
@@ -302,11 +306,15 @@ def _routed_w13(
     pair: pl.Out[pl.Tensor],
     route_weights: pl.Tensor,
     compact_weights: pl.Out[pl.Tensor],
+    input_starts: pl.Tensor,
+    replica: pl.Tensor,
     experts: pl.Scalar[pl.INDEX],
     stride: pl.Scalar[pl.INDEX],
     width: pl.Scalar[pl.INDEX],
     hidden: pl.Scalar[pl.INDEX],
     activation_rows: pl.Scalar[pl.INDEX],
+    input_rows: pl.Scalar[pl.INDEX],
+    home_experts: pl.Scalar[pl.INDEX],
     row_capacity: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Store compact BF16 projections and route weights with the same row order."""
@@ -345,12 +353,14 @@ def _routed_w2(
     weight: pl.Tensor,
     weight_scale: pl.Tensor,
     output: pl.Out[pl.Tensor],
+    replica: pl.Tensor,
     experts: pl.Scalar[pl.INDEX],
     stride: pl.Scalar[pl.INDEX],
     width: pl.Scalar[pl.INDEX],
     hidden: pl.Scalar[pl.INDEX],
     output_rows: pl.Scalar[pl.INDEX],
     activation_rows: pl.Scalar[pl.INDEX],
+    home_experts: pl.Scalar[pl.INDEX],
     row_capacity: pl.constexpr,
 ) -> pl.Tensor:
     """Store full-K BF16 results in compact active-row order."""
@@ -370,40 +380,46 @@ def _expert_routed_output(
     w2: pl.Tensor,
     w2_scale: pl.Tensor,
     input_ready: pl.Scalar[pl.TASK_ID],
-    experts: pl.constexpr,
+    input_starts: pl.Tensor,
+    replica: pl.Tensor,
+    experts: pl.Scalar[pl.INDEX],
+    home_experts: pl.constexpr,
     stride: pl.constexpr,
     width: pl.constexpr,
     hidden: pl.constexpr,
     row_capacity: pl.constexpr,
+    cube_workers: pl.constexpr,
+    vector_workers: pl.constexpr,
 ):
     """Run BF16 W13, FP32 weighted MXFP8 activation, and full-K BF16 W2.
 
-    Counts are immutable after input_ready, lie in [0, stride], and sum to
-    at most row_capacity. Stride is divisible by 16; width and hidden are
-    divisible by 256.
+    Counts are immutable after input_ready and sum to at most row_capacity.
+    A zero stride selects aligned input starts. Width and hidden are divisible by 256.
     """
     activation_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
     compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
+    input_rows = pl.tensor.dim(x, 0)
+    with pl.spmd(cube_workers, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
         pair, compact_weights = _routed_w13(
             x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
-            weights, compact_weights, experts, stride, width, hidden, activation_rows, row_capacity,
+            weights, compact_weights, input_starts, replica,
+            experts, stride, width, hidden, activation_rows, input_rows, home_experts, row_capacity,
         )
 
     payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
+    with pl.spmd(vector_workers, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
         payload, scales = _routed_swiglu_quant(
             pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
         )
 
     output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2", deps=[activation_ready]) as ready:
+    with pl.spmd(cube_workers, name_hint="routed_w2", deps=[activation_ready]) as ready:
         output = _routed_w2(
-            payload, scales, counts, w2, w2_scale, output,
-            experts, stride, width, hidden, output_rows, activation_rows, row_capacity,
+            payload, scales, counts, w2, w2_scale, output, replica,
+            experts, stride, width, hidden, output_rows, activation_rows, home_experts, row_capacity,
         )
     return output, ready
 
@@ -424,20 +440,24 @@ def expert_routed_scatter(
     recv_meta: pl.Tensor,
     routed_output: pld.DistributedTensor,
     input_ready: pl.Scalar[pl.TASK_ID],
+    recv_max: pl.constexpr,
+    cube_workers: pl.constexpr,
+    vector_workers: pl.constexpr,
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = M.num_experts_per_tok,
 ):
     """Compute active expert rows and scatter each source interval to its route destinations."""
-    recv_x_flat = pl.reshape(recv_x, [local_experts * RECV_MAX, D])
-    route_weights = pl.reshape(recv_weights, [local_experts * RECV_MAX, 1])
+    recv_x_flat = pl.reshape(recv_x, [local_experts * recv_max, D])
+    route_weights = pl.reshape(recv_weights, [local_experts * recv_max, 1])
     output, down_ready = _expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
-        routed_w2_packed, routed_w2_scale, input_ready,
-        local_experts, RECV_MAX, D, MOE_INTER,
-        (local_experts if local_experts < topk else topk) * RECV_MAX,
+        routed_w2_packed, routed_w2_scale, input_ready, recv_expert_count, recv_expert_count,
+        local_experts, local_experts, recv_max, D, MOE_INTER,
+        (local_experts if local_experts < topk else topk) * recv_max,
+        cube_workers, vector_workers,
     )
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="ffn_scatter", deps=[down_ready]) as scatter_done:
+    with pl.spmd(vector_workers, name_hint="ffn_scatter", deps=[down_ready]) as scatter_done:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_scatter", no_dep_args=[routed_output]):
             core = pl.tile.get_block_idx()
             total_rows = 0
@@ -500,8 +520,9 @@ def local_compute_test(
     output, down_ready = _expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
-        routed_w2_packed, routed_w2_scale, input_ready,
-        N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, N_LOCAL_EXPERTS * RECV_MAX,
+        routed_w2_packed, routed_w2_scale, input_ready, recv_expert_count, recv_expert_count,
+        N_LOCAL_EXPERTS, N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, N_LOCAL_EXPERTS * RECV_MAX,
+        ROUTED_CUBE_WORKER_TILE, ROUTED_VECTOR_WORKER_TILE,
     )
     with pl.spmd(64, name_hint="ffn_copy", deps=[down_ready]):
         core = pl.tile.get_block_idx()
@@ -535,16 +556,17 @@ def golden_expert_routed(tensors):
     from gemm import golden_gemm_mxfp8_to_fp32_dequantized as matmul_mx_golden
 
     recv_x = tensors["recv_x"]
-    recv_scale_codes = tensors["recv_mx_scale"].reshape(N_LOCAL_EXPERTS * RECV_MAX, K_SCALE)
+    recv_max = recv_x.shape[1]
+    recv_scale_codes = tensors["recv_mx_scale"].reshape(N_LOCAL_EXPERTS * recv_max, K_SCALE)
     recv_scale_decoded = decode_e8m0_codes(recv_scale_codes, side="a")
-    recv_mx_scale = recv_scale_decoded.reshape(N_LOCAL_EXPERTS, RECV_MAX, K_SCALE)
+    recv_mx_scale = recv_scale_decoded.reshape(N_LOCAL_EXPERTS, recv_max, K_SCALE)
     recv_weights = tensors["recv_weights"].float()
     recv_expert_count = tensors["recv_expert_count"]
     w1_scale = decode_e8m0_codes(tensors['routed_w1_scale'], side='b').reshape(N_LOCAL_EXPERTS, K_SCALE, MOE_INTER)
     w3_scale = decode_e8m0_codes(tensors['routed_w3_scale'], side='b').reshape(N_LOCAL_EXPERTS, K_SCALE, MOE_INTER)
     w2_scale = decode_e8m0_codes(tensors['routed_w2_scale'], side='b').reshape(N_LOCAL_EXPERTS, H_SCALE, D)
 
-    recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
+    recv_y = torch.zeros(N_LOCAL_EXPERTS, recv_max, D)
     for e in range(N_LOCAL_EXPERTS):
         n_rows = int(recv_expert_count[e, 0].item())
         if n_rows == 0:
