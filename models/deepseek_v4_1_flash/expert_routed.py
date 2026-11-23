@@ -465,8 +465,8 @@ def expert_routed_scatter(
                 rows_read = pl.read(recv_expert_count, [expert, 0])
                 rows = pl.cast(rows_read, pl.INDEX)
                 total_rows = total_rows + rows
-            rows_per_core = total_rows // ROUTED_VECTOR_WORKER_TILE
-            extra_rows = total_rows % ROUTED_VECTOR_WORKER_TILE
+            rows_per_core = total_rows // vector_workers
+            extra_rows = total_rows % vector_workers
             core_begin = core * rows_per_core + pl.min(core, extra_rows)
             core_rows = rows_per_core + pl.min(pl.max(extra_rows - core, 0), 1)
             core_end = core_begin + core_rows

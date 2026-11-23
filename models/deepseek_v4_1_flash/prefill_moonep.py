@@ -212,45 +212,44 @@ def dispatch_direct(
     move = pl.create_tensor([4], dtype=pl.INT32)
     candidate = pl.create_tensor([4], dtype=pl.INT32)
     replica_rows = pl.create_tensor([3], dtype=pl.INT32)
-    preloaded = hist_ready
-    if layout >= 4:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moonep_read_placement", deps=[published]) as known:
-            for field in pl.range(4):
-                saved = pl.read(route_trace, [trace_start, 2 * TOPK + field])
-                pl.write(move, [field], pl.cast(saved, pl.INT32))
-        preloaded = copy_replica(move, replica_bank, w1, s1, w3, s3, w2, s2, data_arrived, known, rank, epoch)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moonep_placement", deps=[hist_ready, preloaded]) as placement:
-        if layout == 3:
-            place_replica(histogram, replica_cached, move, copy_cost_tiles)
-            if trace_mode == 1:
+    placement = hist_ready
+    if layout >= 3:
+        preloaded = hist_ready
+        if layout >= 4:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="moonep_read_placement", deps=[published]) as known:
                 for field in pl.range(4):
-                    value = pl.read(move, [field])
-                    pl.write(route_trace, [trace_start, 2 * TOPK + field], pl.cast(value, pl.FP32))
-        elif layout == 5:
-            place_replica(histogram, replica_cached, candidate, copy_cost_tiles)
-            matches = pl.cast(1, pl.INT32)
-            for field in pl.range(4):
-                if pl.read(candidate, [field]) != pl.read(move, [field]):
-                    matches = pl.cast(0, pl.INT32)
-            if matches == 0:
-                pl.write(route_trace, [trace_start, 2 * TOPK + 3], -1.0)
-        elif layout < 3:
-            pl.write(move, [0], pl.cast(-1, pl.INT32))
-            pl.write(move, [1], pl.cast(-1, pl.INT32))
-            pl.write(move, [2], pl.cast(0, pl.INT32))
-            pl.write(move, [3], pl.cast(0, pl.INT32))
+                    saved = pl.read(route_trace, [trace_start, 2 * TOPK + field])
+                    pl.write(move, [field], pl.cast(saved, pl.INT32))
+            preloaded = copy_replica(move, replica_bank, w1, s1, w3, s3, w2, s2, data_arrived, known, rank, epoch)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moonep_placement", deps=[hist_ready, preloaded]) as placed:
+            if layout == 3:
+                place_replica(histogram, replica_cached, move, copy_cost_tiles)
+                if trace_mode == 1:
+                    for field in pl.range(4):
+                        value = pl.read(move, [field])
+                        pl.write(route_trace, [trace_start, 2 * TOPK + field], pl.cast(value, pl.FP32))
+            elif layout == 5:
+                place_replica(histogram, replica_cached, candidate, copy_cost_tiles)
+                matches = pl.cast(1, pl.INT32)
+                for field in pl.range(4):
+                    if pl.read(candidate, [field]) != pl.read(move, [field]):
+                        matches = pl.cast(0, pl.INT32)
+                if matches == 0:
+                    pl.write(route_trace, [trace_start, 2 * TOPK + 3], -1.0)
+        placement = placed
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moonep_row_plan", deps=[placement]) as plan_ready:
-        moved_expert = pl.read(move, [0])
-        moved_rank = pl.read(move, [1])
-        moved_count = pl.read(move, [2])
-        keep = pl.cast(0, pl.INT32)
-        if moved_count > 0:
-            full = pl.cast(0, pl.INT32)
-            for source in pl.range(EP_SIZE):
-                full = full + pl.read(histogram, [source, moved_expert])
-            keep = full - moved_count
-        moved_base = pl.cast(0, pl.INT32)
+        if layout >= 3:
+            moved_expert = pl.read(move, [0])
+            moved_rank = pl.read(move, [1])
+            moved_count = pl.read(move, [2])
+            keep = pl.cast(0, pl.INT32)
+            if moved_count > 0:
+                full = pl.cast(0, pl.INT32)
+                for source in pl.range(EP_SIZE):
+                    full = full + pl.read(histogram, [source, moved_expert])
+                keep = full - moved_count
+            moved_base = pl.cast(0, pl.INT32)
 
         for destination in pl.range(EP_SIZE):
             segment = pl.cast(0, pl.INT32)
@@ -263,32 +262,34 @@ def dispatch_direct(
                     if source == rank:
                         pl.write(send_starts, [expert], segment + total)
                     total = total + pl.read(histogram, [source, expert])
-                if expert == moved_expert:
-                    total = keep
+                if layout >= 3:
+                    if expert == moved_expert:
+                        total = keep
                 if destination == rank:
                     pl.write(counts, [slot, 0], total)
                     pl.write(starts, [slot], segment)
                 segment = pl.cast(segment + (total + ALIGN - 1) // ALIGN * ALIGN, pl.INT32)
-            if destination == moved_rank:
-                moved_base = segment
+            if layout >= 3:
+                if destination == moved_rank:
+                    moved_base = segment
         if layout >= 3:
             remaining = pl.cast(0, pl.INT32)
             if rank == moved_rank:
                 remaining = moved_count
             pl.write(starts, [N_LOCAL_EXPERTS], moved_base)
             pl.write(counts, [N_LOCAL_EXPERTS, 0], remaining)
-        own_home = pl.cast(0, pl.INT32)
-        send_move_start = moved_base
-        if moved_count > 0:
-            before = pl.cast(0, pl.INT32)
-            for previous in pl.range(rank):
-                before = before + pl.read(histogram, [previous, moved_expert])
-            own_count = pl.read(histogram, [rank, moved_expert])
-            own_home = pl.cast(pl.min(own_count, pl.max(keep - before, 0)), pl.INT32)
-            send_move_start = pl.cast(moved_base + pl.max(before - keep, 0), pl.INT32)
-        pl.write(replica_rows, [0], own_home)
-        pl.write(replica_rows, [1], send_move_start)
-        pl.write(replica_rows, [2], moved_rank)
+            own_home = pl.cast(0, pl.INT32)
+            send_move_start = moved_base
+            if moved_count > 0:
+                before = pl.cast(0, pl.INT32)
+                for previous in pl.range(rank):
+                    before = before + pl.read(histogram, [previous, moved_expert])
+                own_count = pl.read(histogram, [rank, moved_expert])
+                own_home = pl.cast(pl.min(own_count, pl.max(keep - before, 0)), pl.INT32)
+                send_move_start = pl.cast(moved_base + pl.max(before - keep, 0), pl.INT32)
+            pl.write(replica_rows, [0], own_home)
+            pl.write(replica_rows, [1], send_move_start)
+            pl.write(replica_rows, [2], moved_rank)
 
     replica_ready = plan_ready
     if layout == 3:
@@ -306,19 +307,21 @@ def dispatch_direct(
                 weight_row = pl.tile.full([1, ROUTE_WORDS], dtype=pl.FP32, value=0)
                 route_row = pl.tile.full([1, ROUTE_WORDS], dtype=pl.INT32, value=0)
                 pl.tile.write(route_row, [0, 1], rank)
-                selected = pl.read(move, [0])
-                home_count = pl.cast(pl.read(replica_rows, [0]), pl.INDEX)
-                replica_base = pl.cast(pl.read(replica_rows, [1]), pl.INDEX)
-                replica_rank = pl.cast(pl.read(replica_rows, [2]), pl.INDEX)
+                if layout >= 3:
+                    selected = pl.read(move, [0])
+                    home_count = pl.cast(pl.read(replica_rows, [0]), pl.INDEX)
+                    replica_base = pl.cast(pl.read(replica_rows, [1]), pl.INDEX)
+                    replica_rank = pl.cast(pl.read(replica_rows, [2]), pl.INDEX)
                 for offset in pl.range(count):
                     route = pl.tile.read(positions, [0, offset])
                     token = pl.cast(route // TOPK, pl.INDEX)
                     k = pl.cast(route % TOPK, pl.INDEX)
                     row = base + offset
                     peer = destination
-                    if expert == selected and offset >= home_count:
-                        row = replica_base + offset - home_count
-                        peer = replica_rank
+                    if layout >= 3:
+                        if expert == selected and offset >= home_count:
+                            row = replica_base + offset - home_count
+                            peer = replica_rank
                     payload = pl.load(x, [token, 0], [1, D])
                     pld.tile.remote_store(pl.reinterpret_view(payload, pl.INT8), recv_x, peer=peer, offsets=[row, 0])
                     pld.tensor.put(
