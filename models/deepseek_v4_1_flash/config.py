@@ -285,7 +285,7 @@ INDEX_POOL_POSITIONS_DYN = pl.dynamic("INDEX_POOL_POSITIONS_DYN")
 # Parallel configuration
 SUPPORTED_LM_HEAD_TP_SIZES = (1, 2, 4, 8)
 SUPPORTED_CP_SIZES = (1, 2, 4, 8)
-SUPPORTED_EP_SIZES = (2, 4, 8)
+SUPPORTED_EP_SIZES = (1, 2, 4, 8)
 
 
 def _parse_parallel_size(name: str, default: int, choices: Tuple[int, ...]) -> int:
@@ -307,6 +307,7 @@ LM_HEAD_TP_SIZE = _parse_parallel_size("lm-head-tp", 1, SUPPORTED_LM_HEAD_TP_SIZ
 CP_SIZE = _parse_parallel_size("cp", 1, SUPPORTED_CP_SIZES)
 EP_SIZE = _parse_parallel_size("ep", 2, SUPPORTED_EP_SIZES)
 DP_SIZE = EP_SIZE // CP_SIZE
+EXPERT_SLOTS = 0
 
 
 def set_moe_tokens(tokens: int) -> None:

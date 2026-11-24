@@ -62,7 +62,12 @@ Prefill composes embedding and metadata preparation, the configured attention/Mo
 layer schedule, HC collapse, RMSNorm, and vocabulary projection, and samples the
 last query row per request. The reusable `decode_fwd` and its L3 entry
 run only the backbone, retaining final HC state and DSpark target taps. DSpark
-composes the output head and sampling after that backbone. `lm_head` writes
+composes the output head and sampling after that backbone. Resident prefill and decode use fused MegaMoE. With a host-backed expert
+bank, serving selects `offload_prefill_fwd.l3_prefill_fwd` and
+`decode_generate.l3_decode_generate` before compilation. These graphs use
+split dispatch, expert supply, computation and combine. Decode runs the
+backbone and generation head in one chip invocation. Resident decode runs
+the backbone followed by `prefill_fwd.l3_generation_head`. `lm_head` writes
 FP32 logits in place; the prefill rows (both the forward tail and the resident
 generation head) and the DSpark target rows sample through `sample`
 (`sample.py`), which takes per-row temperature, top-k, and top-p filters with
@@ -87,13 +92,27 @@ Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
 
+### Mapped routed experts
+
+Set `config.EXPERT_SLOTS` before importing the model entries. The serving loader
+provides one six-field MXFP4 bank per rank, the per-layer host descriptors and
+the directory initialized by `models.common.expert_cache.initial_expert_cache`.
+Each slot owns its packed weight matrix and independently packed MX scale matrix.
+Rank-local cache state persists across layers and decode calls.
+
+Prefill starts the planner after gathered inputs are ready. Decode can overlap
+planning and copies with input transport. At EP1, one active token reads its
+six routed indices directly, skips copies for slot hits and combines the local
+expert results without peer transport. Other token counts use the general
+expert-count planner.
+
 ## Parallel configuration
 
 | Component | Contract |
 | --- | --- |
 | Attention weights | Full weights on every rank; no attention TP |
 | Prefill CP | `--cp 1/2/4/8`; CP1 uses local attention, CP>1 uses head-tail query placement and KV publication across peers |
-| MoE EP | `--ep 2/4/8`; EP1 is unsupported |
+| MoE EP | `--ep 1/2/4/8`. EP1 owns all routed experts locally |
 | Prefill DP | `DP_SIZE = EP_SIZE // CP_SIZE`; CP must divide EP |
 | Decode attention | CP1. Each rank owns its requests, KV caches, and compressor state |
 | Decode MoE | Dispatch across the EP group and return results to the originating rank |
@@ -101,8 +120,7 @@ the results back into the local HC state.
 
 For prefill, at CP1, each DP group may pack multiple independent requests. At CP>1, each DP
 group supports one request. Different DP groups own independent requests and
-cache state. The standalone attention entries can run CP1 on a single device;
-layer and forward entries also compose EP MoE and require multiple devices.
+cache state. Single-device serving uses CP1, EP1, and LM-head TP1.
 
 For a sequence divided into `2 * CP` contiguous segments, CP rank `r` owns
 segments `r` and `2 * CP - 1 - r`. Thus CP2 assigns segments `(0, 3)` to rank 0

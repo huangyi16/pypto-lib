@@ -170,8 +170,13 @@ def make_gate(token_tile_rows=GATE_M_TILE, hidden_tile_cols=GATE_D_TILE, norm_ro
         # columns so the sort ranks pad experts last. Route write-backs are guarded to
         # active tokens, so the inactive-zero can run here rather than post-route.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+            # Empty ranks must not publish the next layer before its hidden input is ready.
+            _epoch_anchor = pl.read(x_mixed, [0, 0])
+            zero_quant = pl.cast(pl.tile.full([1, D], dtype=pl.INT16, value=0), pl.INT8)
             for zt in pl.range(token_rows):
                 if zt >= active_tokens:
+                    # With no active rows, quant launches no producer for shared FFN.
+                    pl.tile.store(zero_quant, [zt, 0], x_norm_i8)
                     pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
                     for zk in pl.range(TOPK):
                         pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
@@ -370,6 +375,7 @@ def golden_gate_core(tensors):
     denom = topk_vals.sum(dim=-1, keepdim=True)
     weights = (topk_vals / denom) * ROUTE_SCALE
     if num_tokens < token_rows:
+        x_norm_i8[num_tokens:] = 0
         x_norm_scale[num_tokens:] = 0
         indices[num_tokens:] = 0
         weights[num_tokens:] = 0
@@ -448,7 +454,7 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "x_norm_i8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001,
-                                        valid_rows=gate_active_rows(args.num_tokens)),
+                                        valid_rows=None if args.num_tokens <= 0 else gate_active_rows(args.num_tokens)),
             "indices": topk_pair_compare("weights"),
         },
     )

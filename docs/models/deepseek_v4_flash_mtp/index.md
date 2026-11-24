@@ -26,6 +26,14 @@ that every kernel imports as a bare sibling module.
 | Other components | no tensor parallelism — attention is data-parallel (each rank owns its own decode micro-batch) and the MoE is expert-parallel |
 | Quantization | W8A8 INT8: INT8 weights with FP32 dequant scales, activations quantized per token at the INT8 matmuls |
 
+Routed expert weights can be resident on the device or supplied from mapped Host
+memory into a shared slot bank. Mapped execution passes cache state and weight
+descriptors through the forward to MoE; the routed FFN consumes physical weight
+rows and their completion dependencies. Attention and normalization retain their
+ordinary operator interfaces. Compile mapped A2/A3 graphs with
+`CompileOptions(disable_early_resolve=True)` to preserve full task completion
+before concurrent Host reads.
+
 ### What is quantized
 
 Activations are quantized **dynamically per token**: each row's amax (floored
