@@ -93,7 +93,7 @@ the results back into the local HC state.
 | --- | --- |
 | Attention weights | Full weights on every rank; no attention TP |
 | Prefill CP | `--cp 1/2/4/8`; CP1 uses local attention, CP>1 uses head-tail query placement and KV publication across peers |
-| MoE EP | `--ep 2/4/8`; EP1 is unsupported |
+| MoE EP | Resident forwards use `--ep 2/4/8`; mapped expert forwards also support EP1 |
 | Prefill DP | `DP_SIZE = EP_SIZE // CP_SIZE`; CP must divide EP |
 | Decode attention | CP1. Each rank owns its requests, KV caches, and compressor state |
 | Decode MoE | Dispatch across the EP group and return results to the originating rank |
@@ -102,7 +102,8 @@ the results back into the local HC state.
 For prefill, at CP1, each DP group may pack multiple independent requests. At CP>1, each DP
 group supports one request. Different DP groups own independent requests and
 cache state. The standalone attention entries can run CP1 on a single device;
-layer and forward entries also compose EP MoE and require multiple devices.
+resident layer and forward entries also compose EP MoE and require multiple devices.
+The mapped expert path can execute the complete forward on one device.
 
 For a sequence divided into `2 * CP` contiguous segments, CP rank `r` owns
 segments `r` and `2 * CP - 1 - r`. Thus CP2 assigns segments `(0, 3)` to rank 0
@@ -125,8 +126,54 @@ shards, and return results to the row owners.
 | Decode attention | Corresponding `decode_swa.py`, `decode_c1a_*` and `decode_c2a_*` files |
 | Layer composition | [`prefill_layer.py`](../../../models/deepseek_v4_1_flash/prefill_layer.py), [`decode_layer.py`](../../../models/deepseek_v4_1_flash/decode_layer.py) |
 | Text forward | [`prefill_fwd.py`](../../../models/deepseek_v4_1_flash/prefill_fwd.py), [`decode_fwd.py`](../../../models/deepseek_v4_1_flash/decode_fwd.py) |
+| Mapped expert forward | [`offload_prefill_fwd.py`](../../../models/deepseek_v4_1_flash/offload_prefill_fwd.py), [`decode_generate.py`](../../../models/deepseek_v4_1_flash/decode_generate.py) |
 | Speculative decoding | [`decode_fwd_dspark.py`](../../../models/deepseek_v4_1_flash/decode_fwd_dspark.py), `dspark_drafter.py`, `dspark_init.py`, `decode_metadata.py`, `dspark_attn.py`, and `markov.py` |
 | Shared operators | `hc.py`, `qkv_proj_rope.py`, `compressor.py`, `sparse_attention.py`, `o_proj.py`, `engram.py`, `lm_head.py`, and `sample.py` |
+
+The shared forward implementations require explicit `expert_state`,
+`expert_descriptors`, `expert_slots`, and `offload` arguments. The last two are
+compile-time values. Resident entries select `offload=False`, retain the fused
+MoE implementation, and bind shape-correct state and descriptor placeholders
+with one slot. These tensors are not read or written by the resident graph.
+Serving allocates them once per worker and frees them on close. Their tensor
+payload totals 23,088 bytes per rank at EP4 or 15,408 bytes at EP8. Inactive
+communication arguments reuse the resident MoE workspace, so they add no graph
+allocation or transport tasks.
+Resident mode does not construct an expert pool or map expert Host windows.
+Engram's upstream Host tables are a separate resource used by both modes.
+
+Mapped entries select `offload=True` and retain the split dispatch, cache
+planning/copy, routed-expert and combine path. They do not use the fused MoE
+kernel. The expert banks and cache state are `InOut` parameters on mapped entry
+wrappers; descriptors are read-only. Resident routed weights remain read-only.
+Each slot retains ordinary packed FP4 weights and independently packed MX
+scales; resident weight packing is unchanged. The routed C++ kernels retain
+upstream row-tile transitions and synchronization in both modes.
+
+Mapped prefill requires enough slots for all local experts in one layer.
+The mapped decode entry includes the output head and sampling after the shared
+backbone and currently supports non-speculative generation.
+
+This integration is validated with compiler `f18a9a60e`, based on `22371da74`,
+and that compiler's pinned runtime and PTOAS versions. The compiler fixes
+constexpr-dead dependency lowering, selected-branch Tensor metadata, and
+orchestration loop-alias naming; the unpatched base cannot compile the shared
+generic signatures reliably.
+
+Rebase validation covers native compilation of mapped EP1/EP4 decode and
+prefill, resident EP4 decode/prefill/DSpark, mapped planner/copy execution, and
+routed-expert numerical checks with changing row tiles and shuffled cache slots.
+Resident decode and prefill orchestration match the upstream computation and
+dependencies after accounting for the two added parameters. A checkpoint-backed
+EP1 serving smoke test passes a 20-token prompt and a 546-token chunked-prefill
+prompt, each repeated twice with identical generated token IDs. EP4 checkpoint
+generation has not been repeated for this rebase.
+
+Earlier checkpoint checks, before this rebase, found the same incorrect short
+answer in resident EP4 and mapped EP4, plus unclassified repeat-generation
+differences. Those observations did not establish a mapped-expert regression.
+Planner/copy and routed-expert numerical checks alone do not establish complete
+checkpoint generation accuracy.
 
 The standalone decode MoE and direct DSpark entries can pack routed FP4
 weights before resident upload. For DSpark, use

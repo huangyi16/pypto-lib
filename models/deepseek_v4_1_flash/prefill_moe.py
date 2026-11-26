@@ -100,7 +100,8 @@ SCALE_PACK_TMP_TILE = 2 * ((K_SCALE + 63) // 32) * 32
 RECV_GATHER_TILE = 32
 
 
-MOE_WORKSPACE_BYTES = workspace_bytes(EP_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
+if EP_SIZE != 1:
+    MOE_WORKSPACE_BYTES = workspace_bytes(EP_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -689,7 +690,8 @@ def make_prefill_moe(local_experts):
     return prefill_moe, prefill_moe_slabs
 
 
-prefill_moe, prefill_moe_slabs = make_prefill_moe(N_LOCAL_EXPERTS)
+if EP_SIZE != 1:
+    prefill_moe, prefill_moe_slabs = make_prefill_moe(N_LOCAL_EXPERTS)
 
 
 @pl.jit

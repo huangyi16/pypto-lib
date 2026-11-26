@@ -698,8 +698,8 @@ class EngramHostTables:
     """Own the streamed ENP payload and scale Host shards."""
 
     def __init__(self, checkpoint, ranks, *, num_embeddings=M.engram_num_embeddings, program_count=1):
-        if ranks not in (2, 4, 8):
-            raise ValueError("Engram ENP offload requires two, four, or eight ranks")
+        if ranks not in (1, 2, 4, 8):
+            raise ValueError("Engram ENP offload requires one, two, four, or eight ranks")
         if program_count < 1:
             raise ValueError("Engram Host-window program count must be positive")
         self.ranks = ranks

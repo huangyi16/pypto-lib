@@ -254,7 +254,8 @@ def specialize_mega_moe(local_experts, topk, packed_routed_weights=False):
 
 
 # Kernel used by the independent, guarded expert-row validation below.
-_validation_moe = specialize_mega_moe(N_LOCAL_EXPERTS, TOPK)
+if EP_WORLD_SIZE != 1:
+    _validation_moe = specialize_mega_moe(N_LOCAL_EXPERTS, TOPK)
 
 
 @pl.jit(auto_scope=False)
@@ -322,7 +323,8 @@ def local_compute_test(
     return routed_y
 
 
-_LOCAL_COMPUTE_WINDOW_BYTES = workspace_bytes(EP_WORLD_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
+if EP_WORLD_SIZE != 1:
+    _LOCAL_COMPUTE_WINDOW_BYTES = workspace_bytes(EP_WORLD_SIZE, N_LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
 
 
 @pl.jit.host

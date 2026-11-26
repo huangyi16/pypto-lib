@@ -40,12 +40,21 @@ struct StoreOutput {
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
     auto* counts = tensorData<int32_t>(args, 2);
+#ifdef EXPERT_SLOT_MAP
+    const int64_t experts = args[7];
+    const int64_t stride = args[8];
+    const int64_t width = args[9];
+    const int64_t hidden = args[10];
+    const int64_t outputRows = args[11];
+    const int64_t activationRows = args[12];
+#else
     const int64_t experts = args[6];
     const int64_t stride = args[7];
     const int64_t width = args[8];
     const int64_t hidden = args[9];
     const int64_t outputRows = args[10];
     const int64_t activationRows = args[11];
+#endif
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
     const int64_t nTiles = width / N_TILE;
@@ -65,6 +74,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     int64_t previousRowTile = 0;
     for (int64_t expert = 0; expert < experts; ++expert) {
         const int64_t count = acquireCount(counts, expert);
+#ifdef EXPERT_SLOT_MAP
+        // Slot scales are independently packed, unlike the resident expert-major view.
+        const int64_t slot = count ? acquireCount(tensorData<int32_t>(args, 6), expert) : 0;
+        const int64_t scaleOffset = slot * (hidden / 32) * width;
+#endif
         const int64_t rowTile = selectRowTile(count);
         if (count > 0) {
             // Drain both lanes before changing the shared L1 partition.
@@ -81,11 +95,23 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
             const int64_t col = work % nTiles * N_TILE;
             const int64_t valid = count - row < rowTile ? count - row : rowTile;
 #ifdef __DAV_VEC__
+#ifdef EXPERT_SLOT_MAP
+            dispatchWeight(rowTile, weight, hidden, width, slot, col);
+#else
             dispatchWeight(rowTile, weight, hidden, width, expert, col);
 #endif
+#endif
 #ifdef __DAV_CUBE__
+#ifdef EXPERT_SLOT_MAP
+            const Chunk chunk{0, activationBase + row, valid};
+#else
             const Chunk chunk{expert, activationBase + row, valid};
+#endif
+#ifdef EXPERT_SLOT_MAP
+            dispatchProjection(rowTile, x, xScale, weightScale + scaleOffset, hidden, width, 1,
+#else
             dispatchProjection(rowTile, x, xScale, weightScale, hidden, width, experts,
+#endif
                                       activationRows, chunk, col,
                                       StoreOutput{out, width, outputRows, compactBase + row, col});
 #endif

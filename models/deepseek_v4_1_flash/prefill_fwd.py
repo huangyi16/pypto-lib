@@ -45,7 +45,7 @@ import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--checkpoint")
-_shape_parser.add_argument("--ep", type=int, choices=[2, 4, 8])
+_shape_parser.add_argument("--ep", type=int, choices=[1, 2, 4, 8])
 _shape_parser.add_argument("--capacity", type=int, default=128)
 _shape_parser.add_argument("--moe-tokens", type=int, default=1024)
 _shape_parser.add_argument("--dp", type=int)
@@ -89,6 +89,8 @@ from gate import gather_routing_bias
 from sample import sample
 
 BIAS_DYN = pl.dynamic("PREFILL_FORWARD_BIAS_DYN")
+from models.common.expert_cache import expert_cache_shape, initial_expert_cache
+from offload_prefill_moe import prefill_moe_slabs as offload_prefill_moe_slabs
 from mega_moe import workspace_bytes
 from prefill_moe import FORWARD_LOCAL_EXPERTS as LOCAL_EXPERTS, make_prefill_moe
 from compressor import STATE_WIDTH
@@ -113,6 +115,8 @@ C1A_TABLE_DYN = pl.dynamic("PREFILL_C1A_TABLE")
 if RANKS * LOCAL_EXPERTS % 16:
     _shape_parser.error("--experts-per-rank must give a total expert count aligned to 16")
 N_LAYERS = M.num_hidden_layers
+RESIDENT_EXPERT_SLOTS = 1
+RESIDENT_CACHE_ROWS, RESIDENT_CACHE_COLS = expert_cache_shape(RESIDENT_EXPERT_SLOTS, N_LAYERS, LOCAL_EXPERTS)
 # Checkpoint-generation default (capacity 16); --ring-heap-mib overrides it.
 RING_HEAP_BYTES = 1 * 1024**3
 # The standalone smoke needs 4 GiB per ring: at 1 GiB the first prepared-worker
@@ -141,8 +145,9 @@ O_LORA = M.o_lora_rank
 Q_LORA = M.q_lora_rank
 TOPK = M.num_experts_per_tok
 
-_, prefill_moe_slabs = make_prefill_moe(LOCAL_EXPERTS)
-MOE_WORKSPACE_BYTES = workspace_bytes(RANKS, LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
+if RANKS != 1:
+    _, prefill_moe_slabs = make_prefill_moe(LOCAL_EXPERTS)
+    MOE_WORKSPACE_BYTES = workspace_bytes(RANKS, LOCAL_EXPERTS, MOE_TOKENS, TOPK, D, MOE_INTER)
 
 ROPE_DIM = M.qk_rope_head_dim
 
@@ -516,12 +521,12 @@ def prefill_fwd(
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
     gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
-    routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w1: pl.Tensor,
+    routed_w1_scale: pl.Tensor,
+    routed_w2: pl.Tensor,
+    routed_w2_scale: pl.Tensor,
+    routed_w3: pl.Tensor,
+    routed_w3_scale: pl.Tensor,
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -571,6 +576,19 @@ def prefill_fwd(
     head_logits: pld.DistributedTensor[[16, VOCAB], pl.BF16],
     head_logits_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
+    recv_meta: pld.DistributedTensor,
+    recv_x: pld.DistributedTensor,
+    recv_scale: pld.DistributedTensor,
+    recv_weights: pld.DistributedTensor,
+    recv_routes: pld.DistributedTensor,
+    arrived: pld.DistributedTensor,
+    data_arrived: pld.DistributedTensor,
+    routed_output: pld.DistributedTensor,
+    combine_arrived: pld.DistributedTensor,
+    expert_state: pl.InOut[pl.Tensor],
+    expert_descriptors: pl.Tensor,
+    expert_slots: pl.constexpr,
+    offload: pl.constexpr,
 ):
     """Run both CED stages and retire communication signals after the decoder."""
     correction_bias.bind_dynamic(0, BIAS_DYN)
@@ -783,12 +801,20 @@ def prefill_fwd(
         gather_routing_bias(
             stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS, refresh_row_ids=False,
         )
-        layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
-        layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
-        layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
-        layer_routed_w2_scale: pl.Tensor[[LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [layer * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
-        layer_routed_w3: pl.Tensor[[LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
-        layer_routed_w3_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+        if offload:
+            layer_routed_w1: pl.Tensor[[expert_slots, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [expert_slots, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [0, 0, 0])
+            layer_routed_w1_scale: pl.Tensor[[expert_slots * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.ND] = pl.slice(routed_w1_scale, [expert_slots * (D // MX_GROUP), MOE_INTER], [0, 0])
+            layer_routed_w2: pl.Tensor[[expert_slots, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [expert_slots, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [0, 0, 0])
+            layer_routed_w2_scale: pl.Tensor[[expert_slots * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.ND] = pl.slice(routed_w2_scale, [expert_slots * (MOE_INTER // MX_GROUP), D], [0, 0])
+            layer_routed_w3: pl.Tensor[[expert_slots, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [expert_slots, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [0, 0, 0])
+            layer_routed_w3_scale: pl.Tensor[[expert_slots * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.ND] = pl.slice(routed_w3_scale, [expert_slots * (D // MX_GROUP), MOE_INTER], [0, 0])
+        else:
+            layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+            layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+            layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+            layer_routed_w2_scale: pl.Tensor[[LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [layer * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
+            layer_routed_w3: pl.Tensor[[LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+            layer_routed_w3_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
         if layer == 20:
             with pl.scope():
                 # Publish C1A source KV for ALL encoder rows before selecting replay.
@@ -882,15 +908,27 @@ def prefill_fwd(
                     rank // CP_SIZE * CP_SIZE, rank % CP_SIZE, active, layer + 1, mode,
                     c1a_phase=False,
                 )
-        moe_ready = prefill_moe_slabs(
-            attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
-            layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
-            layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
-            layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
-            moe_workspace,
-            slab_hidden, slab_pre, slab_mixed, slab_rows,
-            moe_ready, local_active, capacity=LOCAL_CAPACITY,
-        )
+        if offload:
+            moe_ready = offload_prefill_moe_slabs(
+                attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
+                layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
+                layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
+                layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+                routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
+                moe_ready, local_active, rank, layer + 1, capacity=LOCAL_CAPACITY,
+                expert_state=expert_state, expert_descriptors=expert_descriptors, expert_layer=layer,
+            )
+        else:
+            moe_ready = prefill_moe_slabs(
+                attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
+                layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
+                layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
+                layer_shared_w3, layer_shared_w3_scale, local_next_pre, ffn_mixed, local_next_hidden,
+                moe_workspace,
+                slab_hidden, slab_pre, slab_mixed, slab_rows,
+                moe_ready, local_active, capacity=LOCAL_CAPACITY,
+            )
         if CP_SIZE > 1:
             moe_ready = prefill_cp_gather_hc(
                 local_next_hidden, local_next_pre, restore_indices[stage], next_hidden, next_pre,
@@ -1058,6 +1096,8 @@ def l2_prefill_fwd(
     head_logits: pld.DistributedTensor[[16, VOCAB], pl.BF16],
     head_logits_done: pld.DistributedTensor[[C.LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
+    expert_state: pl.InOut[pl.Tensor[[RESIDENT_CACHE_ROWS, RESIDENT_CACHE_COLS], pl.INT32]],
+    expert_descriptors: pl.Tensor[[N_LAYERS, 6, 4], pl.INT64],
 ):
     return prefill_fwd(
         embedding,
@@ -1087,6 +1127,9 @@ def l2_prefill_fwd(
         attention_window, attention_arrived, hc_window, hc_arrived,
         head_hidden, head_hidden_done, head_logits, head_logits_done,
         rank,
+        # Inactive offload windows reuse the live resident workspace.
+        moe_workspace, moe_workspace, moe_workspace, moe_workspace, moe_workspace, moe_workspace, moe_workspace, moe_workspace, moe_workspace,
+        expert_state, expert_descriptors, RESIDENT_EXPERT_SLOTS, False,
     )
 
 
@@ -1177,6 +1220,8 @@ def l3_prefill_fwd(
     dspark_target_hidden: pl.Out[pl.Tensor[[RANKS, CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[RANKS, 16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[RANKS, 16, 8], pl.INT32]],
+    expert_state: pl.InOut[pl.Tensor[[RANKS, RESIDENT_CACHE_ROWS, RESIDENT_CACHE_COLS], pl.INT32]],
+    expert_descriptors: pl.Tensor[[RANKS, N_LAYERS, 6, 4], pl.INT64],
 ):
     """Append one chunk with EP = DP * CP and return global state/logits.
 
@@ -1329,7 +1374,7 @@ def l3_prefill_fwd(
             head_hidden, head_hidden_done,
             head_logits,
             head_logits_done,
-            rank, device=rank,
+            rank, expert_state[rank], expert_descriptors[rank], device=rank,
         )
 
 
@@ -1378,6 +1423,7 @@ PREFILL_TENSORS = (
     "x_hc_out", "pre_mix_out", "dspark_target_hidden",
     "logits",
     "sampled_ids",
+    "expert_state", "expert_descriptors",
 )
 
 
@@ -2162,6 +2208,10 @@ def generate(
     tables = EngramHostTables(checkpoint, RANKS, program_count=1 + (decode_compiled is not None))
     if tables.rows_per_layer != ENGRAM_ROWS:
         raise ValueError("Engram table shape must match the forward compilation")
+    resident_placeholders = {
+        "expert_state": initial_expert_cache(RESIDENT_EXPERT_SLOTS, N_LAYERS, LOCAL_EXPERTS),
+        "expert_descriptors": torch.zeros((N_LAYERS, 6, 4), dtype=torch.int64),
+    }
     outputs = {
         "x_hc_out": ((CAPACITY, HC_MULT, D), torch.float32),
         "pre_mix_out": ((CAPACITY, HC_MULT), torch.float32),
@@ -2176,6 +2226,7 @@ def generate(
     }
     constants.update(cache_names)
     constants.update(("freqs_cos", "freqs_sin"))
+    constants.update(resident_placeholders)
     generated = [[] for _ in prompts]
     finished = [False] * RANKS
     image_rows_seen = [0] * RANKS
@@ -2242,6 +2293,9 @@ def generate(
                 elif name in outputs:
                     shape, dtype = outputs[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                elif name in resident_placeholders:
+                    value = resident_placeholders[name]
+                    tensors[name] = runtime.alloc_tensor(value.shape, value.dtype, init=value, worker_id=rank)
                 else:
                     value = inputs[name]
                     tensors[name] = runtime.alloc_tensor(value.shape, value.dtype, init=value, worker_id=rank)
@@ -2504,6 +2558,12 @@ def build_tensor_specs(args=None):
         elif name in outputs:
             shape, dtype = outputs[name]
             value = None
+        elif name == "expert_state":
+            value = initial_expert_cache(RESIDENT_EXPERT_SLOTS, N_LAYERS, LOCAL_EXPERTS).repeat(RANKS, 1, 1)
+            shape, dtype = list(value.shape), value.dtype
+        elif name == "expert_descriptors":
+            shape, dtype = [RANKS, N_LAYERS, 6, 4], torch.int64
+            value = torch.zeros(shape, dtype=dtype)
         else:
             value = torch.stack([values[name] for values in rank_values])
             shape, dtype = list(value.shape), value.dtype
